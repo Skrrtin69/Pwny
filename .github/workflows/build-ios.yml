@@ -1,4 +1,4 @@
-name: Build iOS Pwny
+name: Build iOS Pwny (Unsigned)
 
 on:
   workflow_dispatch:
@@ -42,8 +42,7 @@ jobs:
             SpringBoardServices \
             BulletinBoard
           do
-            test -f \
-              "$PRIVATE_FW/$framework.framework/$framework.tbd"
+            test -f "$PRIVATE_FW/$framework.framework/$framework.tbd"
           done
 
           echo "PRIVATE_FRAMEWORKS=$PRIVATE_FW" >> "$GITHUB_ENV"
@@ -58,7 +57,6 @@ jobs:
           sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
           echo "SDK=$sdk_path" >> "$GITHUB_ENV"
 
-          echo "iPhoneOS SDK: $sdk_path"
           xcrun --sdk iphoneos --show-sdk-version
           clang --version
 
@@ -91,12 +89,9 @@ jobs:
           )
 
           if old not in text:
-              raise SystemExit(
-                  "Expected Mbed TLS clone command was not found."
-              )
+              raise SystemExit("Expected Mbed TLS clone command was not found.")
 
           path.write_text(text.replace(old, new))
-          print("Pinned Mbed TLS 2.28.9")
           PY
 
       - name: Build iOS dependencies
@@ -112,7 +107,7 @@ jobs:
             ARCH=arm64 \
             MAKE_TOOLCHAIN_FILE=../toolchain/make/ios_arm64.sh
 
-      - name: Build iPhone ARM64 implant
+      - name: Build unsigned iPhone ARM64 implant
         shell: bash
         run: |
           set -euo pipefail
@@ -133,7 +128,7 @@ jobs:
 
           cmake --build build-ios --parallel
 
-      - name: Validate implant
+      - name: Validate unsigned implant
         shell: bash
         run: |
           set -euo pipefail
@@ -146,17 +141,20 @@ jobs:
           otool -l aarch64.bin > aarch64.otool.txt
           shasum -a 256 aarch64.bin > aarch64.bin.sha256
 
-          file aarch64.bin |
-            grep "Mach-O 64-bit executable arm64"
-
+          file aarch64.bin | grep "Mach-O 64-bit executable arm64"
           test "$(stat -f %z aarch64.bin)" -gt 100000
+
+          if grep -q "LC_CODE_SIGNATURE" aarch64.otool.txt; then
+            echo "ERROR: artifact is signed; expected an unsigned Mach-O."
+            exit 1
+          fi
 
           cat aarch64.bin.sha256
 
-      - name: Upload compiled implant
+      - name: Upload unsigned implant
         uses: actions/upload-artifact@v4
         with:
-          name: pwny-iphone-aarch64
+          name: pwny-iphone-aarch64-unsigned
           path: |
             aarch64.bin
             aarch64.bin.sha256
