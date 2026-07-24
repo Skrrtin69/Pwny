@@ -13,15 +13,46 @@ jobs:
 
     steps:
       - name: Checkout matching Pwny source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: 0efb57f9f80bab3e742d39601154c0ef8653886a
           fetch-depth: 1
+
+      - name: Fetch private iOS framework stubs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_REPO="$RUNNER_TEMP/theos-sdks"
+
+          git init "$SDK_REPO"
+          git -C "$SDK_REPO" remote add origin \
+            https://github.com/theos/sdks.git
+          git -C "$SDK_REPO" sparse-checkout init --cone
+          git -C "$SDK_REPO" sparse-checkout set iPhoneOS16.5.sdk
+          git -C "$SDK_REPO" fetch --depth 1 origin \
+            0222fd5413cf4b9af096f37b4621afa2688572f7
+          git -C "$SDK_REPO" checkout --detach FETCH_HEAD
+
+          PRIVATE_FW="$SDK_REPO/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks"
+
+          for framework in \
+            BackBoardServices \
+            MediaRemote \
+            SpringBoardServices \
+            BulletinBoard
+          do
+            test -f \
+              "$PRIVATE_FW/$framework.framework/$framework.tbd"
+          done
+
+          echo "PRIVATE_FRAMEWORKS=$PRIVATE_FW" >> "$GITHUB_ENV"
 
       - name: Show Apple build environment
         shell: bash
         run: |
           set -euo pipefail
+
           xcodebuild -version
 
           sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -35,6 +66,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          if brew tap | grep -qx "aws/tap"; then
+            brew untap aws/tap
+          fi
+
           brew install autoconf automake libtool cmake
 
       - name: Pin compatible Mbed TLS
@@ -55,7 +91,9 @@ jobs:
           )
 
           if old not in text:
-              raise SystemExit("Expected Mbed TLS clone command was not found.")
+              raise SystemExit(
+                  "Expected Mbed TLS clone command was not found."
+              )
 
           path.write_text(text.replace(old, new))
           print("Pinned Mbed TLS 2.28.9")
@@ -79,15 +117,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          sed -i '' '/PrivateFrameworks/d' \
+            toolchain/cmake/ios_arm64.cmake
+
           cmake \
             -S . \
             -B build-ios \
-            -DCMAKE_TOOLCHAIN_FILE=toolchain/cmake/ios_arm64.cmake \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/cmake/ios_arm64.cmake" \
             -DCMAKE_OSX_SYSROOT="$SDK" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-F${PRIVATE_FRAMEWORKS}" \
             -DMAIN=ON \
-            -DSOURCE=src/main/main.c
+            -DSOURCE="$PWD/src/main/main.c"
 
           cmake --build build-ios --parallel
 
@@ -96,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          cp build-ios/main aarch64.bin
+          cp build-ios/main.app/main aarch64.bin
           chmod 755 aarch64.bin
 
           file aarch64.bin
@@ -104,7 +146,9 @@ jobs:
           otool -l aarch64.bin > aarch64.otool.txt
           shasum -a 256 aarch64.bin > aarch64.bin.sha256
 
-          file aarch64.bin | grep "Mach-O 64-bit executable arm64"
+          file aarch64.bin |
+            grep "Mach-O 64-bit executable arm64"
+
           test "$(stat -f %z aarch64.bin)" -gt 100000
 
           cat aarch64.bin.sha256
