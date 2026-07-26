@@ -1,0 +1,156 @@
+name: Build iOS Pwny - Start Marker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout matching Pwny source
+        uses: actions/checkout@v5
+        with:
+          ref: 0efb57f9f80bab3e742d39601154c0ef8653886a
+          fetch-depth: 1
+
+      - name: Fetch private iOS framework stubs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_REPO="$RUNNER_TEMP/theos-sdks"
+          git init "$SDK_REPO"
+          git -C "$SDK_REPO" remote add origin https://github.com/theos/sdks.git
+          git -C "$SDK_REPO" sparse-checkout init --cone
+          git -C "$SDK_REPO" sparse-checkout set iPhoneOS16.5.sdk
+          git -C "$SDK_REPO" fetch --depth 1 origin 0222fd5413cf4b9af096f37b4621afa2688572f7
+          git -C "$SDK_REPO" checkout --detach FETCH_HEAD
+
+          PRIVATE_FW="$SDK_REPO/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks"
+          for framework in BackBoardServices MediaRemote SpringBoardServices BulletinBoard; do
+            test -f "$PRIVATE_FW/$framework.framework/$framework.tbd"
+          done
+          echo "PRIVATE_FRAMEWORKS=$PRIVATE_FW" >> "$GITHUB_ENV"
+
+      - name: Show Apple build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk_path="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDK=$sdk_path" >> "$GITHUB_ENV"
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version
+
+      - name: Install build utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          if brew tap | grep -qx "aws/tap"; then
+            brew untap aws/tap
+          fi
+          brew install autoconf automake libtool cmake
+
+      - name: Pin compatible Mbed TLS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("make/Makefile.mbedtls")
+          text = path.read_text()
+          old = "git clone https://github.com/mbed-tls/mbedtls mbed-tls;"
+          new = (
+              "git clone --depth 1 --branch mbedtls-2.28.9 "
+              "https://github.com/mbed-tls/mbedtls mbed-tls;"
+          )
+          if old not in text:
+              raise SystemExit("Expected Mbed TLS clone command was not found.")
+          path.write_text(text.replace(old, new))
+          PY
+
+      - name: Add a one-time start marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >> src/main/main.c <<'EOF'
+
+          /* Diagnostic-only: proves that this program reached startup. */
+          #include <fcntl.h>
+          #include <sys/socket.h>
+          #include <unistd.h>
+          __attribute__((constructor))
+          static void stage_start_marker(void) {
+              const char marker[] = "Pwny-stage-started\n";
+              int fd = open(
+                  "/private/var/mobile/mussel-stage-started.txt",
+                  O_CREAT | O_WRONLY | O_TRUNC,
+                  0644
+              );
+              if (fd >= 0) {
+                  (void)write(fd, marker, sizeof(marker) - 1);
+                  (void)close(fd);
+              }
+              for (int candidate = 0; candidate <= 32; candidate++) {
+                  struct sockaddr_storage peer;
+                  socklen_t peer_size = sizeof(peer);
+                  if (getpeername(candidate, (struct sockaddr *)&peer, &peer_size) == 0) {
+                      (void)send(candidate, marker, sizeof(marker) - 1, MSG_NOSIGNAL);
+                  }
+              }
+          }
+          EOF
+
+      - name: Build iOS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x toolchain/make/ios_arm64.sh
+          make -C make clean
+          make -C make PLATFORM=ios ARCH=arm64 MAKE_TOOLCHAIN_FILE=../toolchain/make/ios_arm64.sh
+
+      - name: Build marked iPhone ARM64 file
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '' '/PrivateFrameworks/d' toolchain/cmake/ios_arm64.cmake
+          cmake -S . -B build-ios \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/cmake/ios_arm64.cmake" \
+            -DCMAKE_OSX_SYSROOT="$SDK" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-F${PRIVATE_FRAMEWORKS}" \
+            -DMAIN=ON \
+            -DSOURCE="$PWD/src/main/main.c"
+          cmake --build build-ios --parallel
+
+      - name: Validate marked file
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp build-ios/main.app/main aarch64.bin
+          chmod 755 aarch64.bin
+          file aarch64.bin | grep "Mach-O 64-bit executable arm64"
+          test "$(stat -f %z aarch64.bin)" -gt 100000
+          shasum -a 256 aarch64.bin > aarch64.bin.sha256
+          cat > READ-ME-FIRST.txt <<'EOF'
+          This is a diagnostic-only build.
+          If this file reaches its startup code, it sends the text
+          "Pwny-stage-started" over the already-open connection and also creates:
+          /private/var/mobile/mussel-stage-started.txt
+          EOF
+
+      - name: Upload marked file
+        uses: actions/upload-artifact@v4
+        with:
+          name: pwny-iphone-start-marker
+          path: |
+            aarch64.bin
+            aarch64.bin.sha256
+            READ-ME-FIRST.txt
+          if-no-files-found: error
